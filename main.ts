@@ -1,20 +1,44 @@
 import { Construct } from "constructs";
-import { App, TerraformOutput, TerraformStack } from "cdktf";
+import { App, Fn, TerraformOutput, TerraformStack, Token } from "cdktf";
 import { AwsProvider, ec2, vpc } from "@cdktf/provider-aws";
-import { PrivateKey } from "@cdktf/provider-tls";
+import { TlsProvider, PrivateKey } from "@cdktf/provider-tls";
 import { writeFileSync } from "fs";
 
 class MyStack extends TerraformStack {
-  constructor(scope: Construct, name: string) {
+
+  ingressPorts: number[] = [22, 80, 443];
+
+  constructor(
+    scope: Construct, name: string, profile: string = "k8s-admin",
+    region: string = "us-east-2", availabilityZone: string = "us-east-2a"
+  ) {
     super(scope, name);
 
     // define resources here
+    // create new TLS provider
+    new TlsProvider(this, "tls-provider", {});
     // configure AWS provider
     new AwsProvider(this, "aws", {
-      region: "us-east-2",
+      region: region,
       sharedConfigFiles: ["~/.aws/config"],
       sharedCredentialsFiles: ["~/.aws/credentials"],
-      profile: "k8s-admin"
+      profile: profile
+    });
+
+    // const amis = ec2.dataAwsAmiIdsFilterToTerraform({
+    //   name: "name",
+    //   values: ["amzn-ami-hvm-*"]
+    // });
+    // console.log(amis);
+
+    // get AMI from AWS
+    const amis = new ec2.DataAwsAmiIds(this, "ami-ids", {
+      owners: ["amazon"],
+      // nameRegex: "^amzn2-ami-hvm-*-x86_64-ebs",
+      filter: [{
+        name: "name",
+        values: ["amzn2-ami-hvm-*-x86_64-ebs"]
+      }]
     });
 
     // create a private key
@@ -22,15 +46,17 @@ class MyStack extends TerraformStack {
       algorithm: "RSA",
       rsaBits: 4096
     });
+    // get output from private key
 
-    // create AWS key pair
+    // create AWS key pair, await
     const keyPair = new ec2.KeyPair(this, "key-pair", {
         keyName: "my-key-pair",
-        publicKey: privateKey.publicKeyOpenssh
+        publicKey: Token.asString(privateKey.publicKeyOpenssh)
     });
 
     // save the private key to a local file (local_sensitive_file)
-    writeFileSync("id_rsa", privateKey.privateKeyOpenssh);
+    // TODO: this saves the key as a TOKEN, not the actual key
+    writeFileSync("id_rsa", Fn.tostring(privateKey.privateKeyOpenssh));
 
     // create a VPC
     const terraformVpc = new vpc.Vpc(this, "vpc", {
@@ -44,7 +70,7 @@ class MyStack extends TerraformStack {
 
     // create a (public) subnet
     const publicSubnet = new vpc.Subnet(this, "public-subnet", {
-      availabilityZone: "us-east-2a",
+      availabilityZone: availabilityZone,
       cidrBlock: "10.0.1.0/24",
       vpcId: terraformVpc.id,
       tags: {
@@ -81,14 +107,17 @@ class MyStack extends TerraformStack {
     // create a security group to allow SSH access
     const securityGroup = new vpc.SecurityGroup(this, "security-group", {
       vpcId: terraformVpc.id,
-      description: "Allow SSH access",
-      ingress: [{
-        fromPort: 22,
-        toPort: 22,
-        protocol: "tcp",
-        cidrBlocks: ["0.0.0.0/0"],
-        ipv6CidrBlocks: ["::/0"]
-      }],
+      description: "Allow SSH and web access",
+      // loop over ingressPorts
+      ingress: this.ingressPorts.map(port => {
+        return {
+          fromPort: port,
+          toPort: port,
+          protocol: "tcp",
+          cidrBlocks: ["0.0.0.0/0"],
+          ipv6CidrBlocks: ["::/0"]
+        };
+      }),
       egress: [{
         fromPort: 0,
         toPort: 0,
@@ -104,7 +133,7 @@ class MyStack extends TerraformStack {
     // now create the EC2 instance
     const instance = new ec2.Instance(this, "instance", {
       instanceType: "t2.micro",
-      ami: "ami-0b9e9e9e",
+      ami: Fn.element(amis.ids, 0).toString(), // "ami-0fa49cc9dc8d62c84", //amis[0],
       keyName: keyPair.keyName,
       vpcSecurityGroupIds: [securityGroup.id],
       subnetId: publicSubnet.id,
@@ -118,6 +147,11 @@ class MyStack extends TerraformStack {
     new TerraformOutput(this, "public_ip", {
       value: instance.publicIp,
     });
+
+    // new TerraformOutput(this, "private_key", {
+    //   value: privateKey.privateKeyOpenssh,
+    //   sensitive: true
+    // });
 
   }
 }
